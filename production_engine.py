@@ -22,30 +22,35 @@ def format_precision(val: float, precision: int = 8) -> Decimal:
 
 class ProductionScalpEngine:
     def __init__(self):
-        # قراءة المتغيرات البيئية من Railway
+        # 1. قراءة المتغيرات البيئية من Railway
         self.system_name = os.getenv("SYSTEM_NAME", "MEXC-v4")
         self.paper_trading = os.getenv("PAPER_TRADING", "True").lower() == "true"
         self.initial_capital = float(os.getenv("INITIAL_CAPITAL", "500.0"))
         self.cash_usdt = self.initial_capital
         
+        # إدارة التخصيص والمخاطر المحدثة عبر المتغيرات
+        self.max_open_positions = int(os.getenv("MAX_SLOTS", "4"))
+        self.slot_size = float(os.getenv("FIXED_TRADE_USD", "100.0"))
+        self.max_total_capital = float(os.getenv("MAX_TOTAL_CAPITAL", "400.0"))
+        
+        # قائمة العملات المستهدفة
+        self.target_symbols = ["ETH/USDT", "SOL/USDT", "XRP/USDT", "BNB/USDT", "ADA/USDT"]
+        
+        # إعدادات الاتصال بتيليجرام
         self.tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
         self.tg_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
         
-        # إدارة التخصيص والمخاطر
-        self.slot_size = 100.0          # 100 USDT ثابتة لكل مركز
-        self.max_open_positions = 3     # 3 مراكز متزامنة كحد أقصى
-        self.target_symbols = ["ETH/USDT", "SOL/USDT", "XRP/USDT"]
+        # أهداف الربح والخسارة
+        self.take_profit_pct = 0.0075   # +0.75%
+        self.hard_stop_loss_pct = 0.010 # -1.00%
+        self.time_sl_threshold = 0.0035 # -0.35%
+        self.max_holding_minutes = 25   # 25 دقيقة
         
-        self.take_profit_pct = 0.0075   # هدف الربح: +0.75%
-        self.hard_stop_loss_pct = 0.010 # وقف الخسارة الصارم: -1.0%
-        self.time_sl_threshold = 0.0035 # تصفية جبرية إذا استمر التراجع بعد انتهاء المهلة (-0.35%)
-        self.max_holding_minutes = 25   # أقصى مدة بقاء للمركز (25 دقيقة)
+        # هيكل عمولات MEXC Spot
+        self.taker_fee = 0.001   # 0.10% Taker
+        self.maker_fee = 0.000   # 0.0% Maker (صفر عمولة)
         
-        # هيكل رسوم التداول الخاص بـ MEXC Spot
-        self.taker_fee = 0.001   # 0.10% عند الدخول الفوري بأمر السوق
-        self.maker_fee = 0.000   # 0.0% عمولة صانع السوق (Maker) في MEXC
-        
-        # عدادات وتتبع الصفقات والأرباح الشهرية
+        # سجلات الصفقات والأرباح الشهرية
         self.trade_counter = 0
         self.current_month = datetime.now(timezone.utc).month
         self.monthly_realized_pnl = 0.0
@@ -54,10 +59,9 @@ class ProductionScalpEngine:
         self.cooldown_tracker = {}
         self.closed_trades = []
         
-        # إعداد الاتصال بمنصة MEXC وقراءة المفاتيح من متغيرات البيئة
+        # إعداد عميل MEXC
         api_key = os.getenv("MEXC_API_KEY", "")
         api_secret = os.getenv("MEXC_API_SECRET", "")
-        
         self.exchange = ccxt.mexc({
             'apiKey': api_key,
             'secret': api_secret,
@@ -87,7 +91,7 @@ class ProductionScalpEngine:
             logger.error(f"خطأ أثناء الاتصال بتيليجرام: {e}")
 
     def check_monthly_reset(self):
-        """تصفير الأرباح التراكمية تلقائياً عند حلول أول دقيقة من كل شهر جديد"""
+        """تصفير الأرباح التراكمية تلقائياً في أول دقيقة من كل شهر جديد"""
         now = datetime.now(timezone.utc)
         if now.month != self.current_month:
             logger.info(f"🔄 بداية شهر جديد ({now.strftime('%B')})! تصفير العداد التراكمي للأرباح.")
@@ -101,7 +105,7 @@ class ProductionScalpEngine:
             )
 
     async def auto_heal(self):
-        """محرك المعالجة الذاتية: إلغاء الأوامر العالقة ومزامنة السيولة عند الإقلاع"""
+        """محرك المعالجة الذاتية: إلغاء الأوامر ومزامنة المحفظة عند الإقلاع"""
         logger.info("🛠️ [Auto-Heal] جاري فحص الإقلاع ومزامنة المحفظة مع MEXC...")
         if not self.paper_trading:
             try:
@@ -118,7 +122,7 @@ class ProductionScalpEngine:
         logger.info(f"✅ [Auto-Heal] تمت المزامنة | الكاش المتاح: ${self.cash_usdt:,.2f} USDT")
 
     async def check_btc_shield(self) -> bool:
-        """درع اتجاه البيتكوين: حظر الشراء إذا كان BTC تحت EMA20 على فريم 15m"""
+        """درع اتجاه البيتكوين: حظر الشراء إذا كان السعر أدنى من EMA20 على 15m"""
         try:
             ohlcv = await self.exchange.fetch_ohlcv('BTC/USDT', timeframe='15m', limit=30)
             df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
@@ -137,17 +141,15 @@ class ProductionScalpEngine:
             return False
 
     async def fetch_signals(self, symbol: str):
-        """تحليل الشموع على فريم 1m باستخدام pandas النقي دون الحاجة لمكتبات خارجية"""
+        """تحليل الشموع على فريم 1m باستخدام pandas النقي"""
         try:
             ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe='1m', limit=40)
             df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             df['c'] = df['c'].astype(float)
 
-            # حساب EMA 5 و EMA 12 عبر pandas مباشرة
             df['ema_fast'] = df['c'].ewm(span=5, adjust=False).mean()
             df['ema_slow'] = df['c'].ewm(span=12, adjust=False).mean()
 
-            # حساب RSI 14 بدقة قياسية
             delta = df['c'].diff()
             gain = (delta.where(delta > 0, 0.0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0.0)).rolling(window=14).mean()
@@ -168,7 +170,15 @@ class ProductionScalpEngine:
             return None, 0.0
 
     async def open_position(self, symbol: str, current_price: float):
-        """فتح مركز جديد وحساب مستويات الخروج وإرسال إشعار تيليجرام"""
+        """فتح مركز جديد مع تطبيق قيود MAX_SLOTS و MAX_TOTAL_CAPITAL"""
+        # حساب رأس المال المحجوز حالياً في المراكز النشطة
+        currently_allocated_capital = sum(p['cost'] for p in self.open_positions.values())
+        
+        # التحقق من أن الصفقة لن تتجاوز السقف الإجمالي لرأس المال المسموح به
+        if (currently_allocated_capital + self.slot_size) > self.max_total_capital:
+            logger.warning(f"⚠️ تم حظر فتح مركز على {symbol}: سيتم تجاوز سقف رأس المال الكلي المسموح (${self.max_total_capital:.2f})")
+            return
+
         if self.cash_usdt < self.slot_size:
             return
 
@@ -208,13 +218,14 @@ class ProductionScalpEngine:
             f"📦 *حجم المركز:* `${cost:.2f}`\n"
             f"🎯 *الهدف (TP):* `${tp:,.4f}` (+0.75%)\n"
             f"🛑 *وقف الخسارة (SL):* `${sl:,.4f}` (-1.00%)\n"
-            f"💼 *الكاش المتبقي:* `${self.cash_usdt:,.2f}`"
+            f"💼 *الكاش المتبقي:* `${self.cash_usdt:,.2f}`\n"
+            f"📊 *المراكز النشطة:* `{len(self.open_positions)}/{self.max_open_positions}`"
         )
         logger.info(f"🟢 [دخول صفقة] {trade_id} على {symbol} | السعر: ${current_price:,.4f}")
         await self.send_telegram_alert(alert_msg)
 
     async def close_position(self, symbol: str, current_price: float, reason: str, is_maker: bool = False):
-        """إغلاق المركز وتحديث الأرباح الصافية وإرسال تقرير تيليجرام"""
+        """إغلاق المركز وتحديث الأرباح وإرسال تقرير تيليجرام"""
         pos = self.open_positions.pop(symbol)
         gross_value = pos['qty'] * current_price
         exit_fee = gross_value * (self.maker_fee if is_maker else self.taker_fee)
@@ -260,7 +271,7 @@ class ProductionScalpEngine:
         await self.send_telegram_alert(alert_msg)
 
     async def monitor_open_positions(self):
-        """مراقبة الأهداف وتطبيق الخروج الزمني وحساب القيمة السوقية الحية"""
+        """مراقبة الأهداف وتطبيق الخروج الزمني وحساب MTM"""
         now = datetime.now(timezone.utc)
         total_open_value = 0.0
 
@@ -273,28 +284,30 @@ class ProductionScalpEngine:
             duration_minutes = (now - pos['entry_time']).total_seconds() / 60
             pnl_pct = (current_price - pos['entry_price']) / pos['entry_price']
 
-            # جني الأرباح (Maker = صفر عمولة في MEXC)
+            # جني الأرباح (Maker = 0% Fee)
             if current_price >= pos['take_profit']:
                 await self.close_position(symbol, current_price, "Take Profit (Maker 0% Fee)", is_maker=True)
             # وقف الخسارة الصارم
             elif current_price <= pos['stop_loss']:
                 await self.close_position(symbol, current_price, "Hard Stop Loss (Market)", is_maker=False)
-            # الخروج الزمني لمنع تجميد السيولة
+            # الخروج الزمني لمنع احتجاز السيولة
             elif duration_minutes >= self.max_holding_minutes and pnl_pct <= -self.time_sl_threshold:
                 await self.close_position(symbol, current_price, "Time SL (Decay Protection)", is_maker=False)
 
         return total_open_value
 
     def display_dashboard(self, total_mtm_equity: float):
-        """لوحة المتابعة الشفافة في السجلات"""
+        """شاشة المتابعة الرقمية الشفافة"""
         total_trades = len(self.closed_trades)
         wins = sum(1 for t in self.closed_trades if t['pnl_usd'] > 0)
         win_rate = (wins / total_trades * 100) if total_trades > 0 else 0.0
+        allocated_cap = sum(p['cost'] for p in self.open_positions.values())
 
         headers = ["المعيار", "القيمة"]
         rows = [
             ["النظام", self.system_name],
             ["الكاش المتاح", f"${self.cash_usdt:,.2f}"],
+            ["رأس المال المحجوز بالصفقات", f"${allocated_cap:,.2f} / ${self.max_total_capital:,.2f}"],
             ["إجمالي حقوق الملكية (MTM)", f"${total_mtm_equity:,.2f}"],
             ["أرباح الشهر التراكمية", f"${self.monthly_realized_pnl:,.2f}"],
             ["المراكز المفتوحة", f"{len(self.open_positions)} / {self.max_open_positions}"],
@@ -310,7 +323,10 @@ class ProductionScalpEngine:
         await self.send_telegram_alert(
             f"🚀 *[{self.system_name}] تم تشغيل النظام بنجاح*\n"
             f"الوضع: `{mode_str}`\n"
-            f"رأس المال الابتدائي: `${self.initial_capital:,.2f}`"
+            f"رأس المال المبدئي: `${self.initial_capital:,.2f}`\n"
+            f"أقصى عدد مراكز: `{self.max_open_positions}`\n"
+            f"حصة المركز: `${self.slot_size:.2f}`\n"
+            f"سقف رأس المال المسموح: `${self.max_total_capital:.2f}`"
         )
         
         cycle_count = 0
@@ -321,6 +337,7 @@ class ProductionScalpEngine:
                 open_mtm_value = await self.monitor_open_positions()
                 total_equity = self.cash_usdt + open_mtm_value
 
+                # فتح مركز جديد فقط عند استيفاء شروط الحماية
                 if btc_safe and len(self.open_positions) < self.max_open_positions:
                     for symbol in self.target_symbols:
                         if symbol not in self.open_positions:
