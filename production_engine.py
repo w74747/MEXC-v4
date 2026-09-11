@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_DOWN
 import aiohttp
+from aiohttp import web
 import asyncpg
 import ccxt.async_support as ccxt
 import pandas as pd
@@ -17,6 +18,7 @@ logging.basicConfig(
 logger = logging.getLogger("MEXC_v4_DB")
 
 def format_precision(val: float, precision: int = 8) -> Decimal:
+    """معالجة الدقة الرقمية وتفادي أخطاء التقريب العلمي"""
     d = Decimal(str(val))
     return d.quantize(Decimal(10) ** -precision, rounding=ROUND_DOWN)
 
@@ -44,6 +46,7 @@ class ProductionScalpEngine:
         self.time_sl_threshold = 0.0035
         self.max_holding_minutes = 25
         
+        # عمولات MEXC Spot
         self.taker_fee = 0.001
         self.maker_fee = 0.000
         
@@ -56,8 +59,9 @@ class ProductionScalpEngine:
         self.cooldown_tracker = {}
         self.closed_trades = []
         self.db_pool = None
+        self.web_runner = None
         
-        # عميل MEXC
+        # إعداد عميل MEXC
         api_key = os.getenv("MEXC_API_KEY", "")
         api_secret = os.getenv("MEXC_API_SECRET", "")
         self.exchange = ccxt.mexc({
@@ -70,8 +74,23 @@ class ProductionScalpEngine:
             }
         })
 
+    async def start_dummy_server(self):
+        """خادم ويب خفيف للرد على فحص الحياة (Healthcheck) في Railway لمنع إيقاف الحاوية"""
+        try:
+            app = web.Application()
+            app.router.add_get('/', lambda r: web.Response(text="Bot is running!"))
+            app.router.add_get('/health', lambda r: web.Response(text="OK"))
+            self.web_runner = web.AppRunner(app)
+            await self.web_runner.setup()
+            port = int(os.getenv("PORT", 8080))
+            site = web.TCPSite(self.web_runner, '0.0.0.0', port)
+            await site.start()
+            logger.info(f"🌐 [Web Server] الخادم المصغر يعمل بنجاح على المنفذ: {port}")
+        except Exception as e:
+            logger.error(f"فشل تشغيل خادم الويب المصغر: {e}")
+
     async def init_database(self):
-        """الاتصال بـ PostgreSQL وبناء الهيكل إذا لم يكن موجوداً"""
+        """الاتصال بـ PostgreSQL وإنشاء جدول الصفقات إذا لم يكن موجوداً"""
         if not self.db_url:
             logger.warning("⚠️ لم يتم تعيين DATABASE_URL! سيعمل البوت بالذاكرة المؤقتة فقط.")
             return
@@ -111,10 +130,9 @@ class ProductionScalpEngine:
             logger.error(f"فشل الاتصال بقاعدة البيانات: {e}")
 
     async def auto_heal(self):
-        """استعادة حالة المراكز المفتوحة والأرباح التراكمية من PostgreSQL عند الإقلاع"""
+        """استعادة ومزامنة المراكز المفتوحة والأرباح التراكمية عند الإقلاع"""
         logger.info("🛠️ [Auto-Heal] بدء استعادة ومزامنة حالة النظام...")
         
-        # مزامنة رصيد المنصة الحي
         if not self.paper_trading:
             try:
                 open_orders = await self.exchange.fetch_open_orders()
@@ -126,14 +144,13 @@ class ProductionScalpEngine:
                 logger.error(f"خطأ أثناء مزامنة المنصة: {e}")
                 raise
 
-        # استعادة الأرباح الشهرية التراكمية والصفقات المفتوحة من DB
         if self.db_pool:
             try:
                 now = datetime.now(timezone.utc)
                 start_of_month = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
 
                 async with self.db_pool.acquire() as conn:
-                    # 1. استعادة أرباح الشهر الحالي
+                    # 1. استرجاع أرباح الشهر الحالي
                     sum_row = await conn.fetchrow("""
                         SELECT COALESCE(SUM(pnl_usd), 0) as month_pnl, COUNT(*) as total_cnt
                         FROM trades 
@@ -145,7 +162,7 @@ class ProductionScalpEngine:
                     count_row = await conn.fetchrow("SELECT COUNT(*) as total FROM trades")
                     self.trade_counter = int(count_row['total'])
 
-                    # 3. استعادة الصفقات المفتوحة التي انقطعت لإكمال إدارتها
+                    # 3. استعادة الصفقات المفتوحة التي انقطعت
                     open_rows = await conn.fetch("SELECT * FROM trades WHERE status = 'OPEN'")
                     for r in open_rows:
                         self.open_positions[r['symbol']] = {
@@ -165,9 +182,10 @@ class ProductionScalpEngine:
             except Exception as e:
                 logger.error(f"خطأ استعادة بيانات قاعدة البيانات: {e}")
 
-        logger.info(f"✅ [Auto-Heal] اكتملت الجاهزية | الكاش الصافي: ${self.cash_usdt:,.2f} USDT")
+        logger.info(f"✅ [Auto-Heal] اكتملت الجاهزية | الكاش المتاح: ${self.cash_usdt:,.2f} USDT")
 
     async def send_telegram_alert(self, message: str):
+        """إرسال إشعار لحظي عبر تيليجرام"""
         if not self.tg_token or not self.tg_chat_id:
             return
         url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
@@ -181,6 +199,7 @@ class ProductionScalpEngine:
             logger.error(f"خطأ اتصال تيليجرام: {e}")
 
     def check_monthly_reset(self):
+        """تصفير الأرباح التراكمية في بداية كل شهر جديد"""
         now = datetime.now(timezone.utc)
         if now.month != self.current_month:
             logger.info(f"🔄 بداية شهر جديد ({now.strftime('%B')})! تصفير العداد التراكمي للأرباح.")
@@ -194,6 +213,7 @@ class ProductionScalpEngine:
             )
 
     async def check_btc_shield(self) -> bool:
+        """درع اتجاه البيتكوين: حظر الشراء إذا كان BTC أدنى من EMA20 على 15m"""
         try:
             ohlcv = await self.exchange.fetch_ohlcv('BTC/USDT', timeframe='15m', limit=30)
             df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
@@ -201,10 +221,11 @@ class ProductionScalpEngine:
             df['ema20'] = df['c'].ewm(span=20, adjust=False).mean()
             return df['c'].iloc[-1] >= df['ema20'].iloc[-1]
         except Exception as e:
-            logger.error(f"خطأ درع BTC: {e}")
+            logger.error(f"خطأ في درع BTC: {e}")
             return False
 
     async def fetch_signals(self, symbol: str):
+        """تحليل الشموع على فريم 1m باستخدام pandas"""
         try:
             ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe='1m', limit=40)
             df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
@@ -233,6 +254,7 @@ class ProductionScalpEngine:
             return None, 0.0
 
     async def open_position(self, symbol: str, current_price: float):
+        """فتح مركز جديد مع تطبيق قيود المخاطر وحفظ البيانات في Postgres"""
         allocated_capital = sum(p['cost'] for p in self.open_positions.values())
         if (allocated_capital + self.slot_size) > self.max_total_capital or self.cash_usdt < self.slot_size:
             return
@@ -264,7 +286,7 @@ class ProductionScalpEngine:
             'entry_fee': entry_fee
         }
 
-        # حفظ الصفقة المفتوحة في PostgreSQL
+        # حفظ الصفقة في قاعدة البيانات
         if self.db_pool:
             try:
                 async with self.db_pool.acquire() as conn:
@@ -294,6 +316,7 @@ class ProductionScalpEngine:
         await self.send_telegram_alert(alert_msg)
 
     async def close_position(self, symbol: str, current_price: float, reason: str, is_maker: bool = False):
+        """إغلاق المركز وتحديث الأرباح الصافية وإرسال تقرير تيليجرام"""
         pos = self.open_positions.pop(symbol)
         gross_value = pos['qty'] * current_price
         exit_fee = gross_value * (self.maker_fee if is_maker else self.taker_fee)
@@ -311,7 +334,7 @@ class ProductionScalpEngine:
         if net_pnl < 0:
             self.cooldown_tracker[symbol] = now + timedelta(minutes=20)
 
-        # تحديث الصفقة المغلقة في PostgreSQL وحفظ لقطة الرصيد والأرباح
+        # تحديث الصفقة في PostgreSQL
         if self.db_pool:
             try:
                 async with self.db_pool.acquire() as conn:
@@ -352,6 +375,7 @@ class ProductionScalpEngine:
         await self.send_telegram_alert(alert_msg)
 
     async def monitor_open_positions(self):
+        """مراقبة الأهداف وتطبيق الخروج الزمني وحساب إجمالي حقوق الملكية MTM"""
         now = datetime.now(timezone.utc)
         total_open_value = 0.0
 
@@ -364,16 +388,20 @@ class ProductionScalpEngine:
             duration_minutes = (now - pos['entry_time']).total_seconds() / 60
             pnl_pct = (current_price - pos['entry_price']) / pos['entry_price']
 
+            # جني الأرباح (Maker = صفر عمولة في MEXC)
             if current_price >= pos['take_profit']:
                 await self.close_position(symbol, current_price, "Take Profit (Maker 0% Fee)", is_maker=True)
+            # وقف الخسارة الصارم
             elif current_price <= pos['stop_loss']:
                 await self.close_position(symbol, current_price, "Hard Stop Loss (Market)", is_maker=False)
+            # الخروج الزمني لمنع احتجاز السيولة
             elif duration_minutes >= self.max_holding_minutes and pnl_pct <= -self.time_sl_threshold:
                 await self.close_position(symbol, current_price, "Time SL (Decay Protection)", is_maker=False)
 
         return total_open_value
 
     def display_dashboard(self, total_mtm_equity: float):
+        """لوحة المتابعة الشفافة في السجلات"""
         allocated_cap = sum(p['cost'] for p in self.open_positions.values())
         headers = ["المعيار", "القيمة"]
         rows = [
@@ -388,9 +416,13 @@ class ProductionScalpEngine:
         print("\n" + tabulate(rows, headers=headers, tablefmt="fancy_grid"))
 
     async def run(self):
+        # 1. تشغيل خادم الرد السريع لمنع إيقاف الحاوية
+        await self.start_dummy_server()
+        
+        # 2. تهيئة الاتصال بقاعدة البيانات ومزامنة الحالة
         await self.init_database()
         await self.auto_heal()
-        logger.info(f"🚀 تم تشغيل {self.system_name} المتصل بقاعدة البيانات بنجاح.")
+        logger.info(f"🚀 تم تشغيل {self.system_name} بنجاح.")
         
         mode_str = "تجريبي (Paper Trading)" if self.paper_trading else "🔴 حقيقي (Live Money)"
         await self.send_telegram_alert(
@@ -426,6 +458,8 @@ class ProductionScalpEngine:
                 await asyncio.sleep(5)
 
     async def shutdown(self):
+        if self.web_runner:
+            await self.web_runner.cleanup()
         if self.db_pool:
             await self.db_pool.close()
         await self.exchange.close()
