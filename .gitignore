@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# البيئة الافتراضية
+venv/
+ENV/
+env/
+
+# ملفات المتغيرات السرية
+.env
+.env.local
+
+# إعدادات المحررات
+.vscode/
+.idea/
