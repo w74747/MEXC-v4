@@ -24,7 +24,7 @@ def format_precision(val: float, precision: int = 8) -> Decimal:
 
 class ProductionScalpEngine:
     def __init__(self):
-        # 1. المتغيرات البيئية من Railway
+        # 1. المتغيرات البيئية الأساسية من Railway
         self.system_name = os.getenv("SYSTEM_NAME", "MEXC-v4")
         self.paper_trading = os.getenv("PAPER_TRADING", "True").lower() == "true"
         self.initial_capital = float(os.getenv("INITIAL_CAPITAL", "500.0"))
@@ -40,17 +40,22 @@ class ProductionScalpEngine:
         self.tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
         self.tg_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
         
-        # أهداف الربح والمخاطرة
-        self.take_profit_pct = 0.0075
-        self.hard_stop_loss_pct = 0.010
-        self.time_sl_threshold = 0.0035
-        self.max_holding_minutes = 25
+        # 2. قواعد التداول وإدارة المخاطر المثبتة برمجياً
+        # نطاق Trailing Take Profit (1% إلى 3%)
+        self.tp_trigger_pct = 0.010          # تفعيل التتبع عند +1.0%
+        self.tp_max_cap_pct = 0.030          # الخروج الحتمي عند +3.0%
+        self.trailing_callback_pct = 0.0035   # ارتداد 0.35% عن القمة لجني الربح
         
-        # عمولات MEXC Spot
+        # الحماية وإيقاف الخسائر
+        self.hard_stop_loss_pct = 0.010      # وقف خسارة صارم -1.0%
+        self.time_sl_threshold = 0.0035      # خروج زمني وقائي إذا استمر التراجع بعد المهلة (-0.35%)
+        self.max_holding_minutes = 25        # أقصى مدة بقاء للمركز (25 دقيقة)
+        
+        # هيكل عمولات MEXC Spot
         self.taker_fee = 0.001
         self.maker_fee = 0.000
         
-        # التتبع والأرباح
+        # التتبع الداخلي والأرباح
         self.trade_counter = 0
         self.current_month = datetime.now(timezone.utc).month
         self.monthly_realized_pnl = 0.0
@@ -75,10 +80,10 @@ class ProductionScalpEngine:
         })
 
     async def start_dummy_server(self):
-        """خادم ويب خفيف للرد على فحص الحياة (Healthcheck) في Railway لمنع إيقاف الحاوية"""
+        """خادم ويب خفيف للرد على Healthcheck في Railway لمنع إيقاف الحاوية"""
         try:
             app = web.Application()
-            app.router.add_get('/', lambda r: web.Response(text="Bot is running!"))
+            app.router.add_get('/', lambda r: web.Response(text="MEXC-v4 is running!"))
             app.router.add_get('/health', lambda r: web.Response(text="OK"))
             self.web_runner = web.AppRunner(app)
             await self.web_runner.setup()
@@ -150,7 +155,7 @@ class ProductionScalpEngine:
                 start_of_month = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
 
                 async with self.db_pool.acquire() as conn:
-                    # 1. استرجاع أرباح الشهر الحالي
+                    # استرجاع أرباح الشهر الحالي
                     sum_row = await conn.fetchrow("""
                         SELECT COALESCE(SUM(pnl_usd), 0) as month_pnl, COUNT(*) as total_cnt
                         FROM trades 
@@ -158,22 +163,24 @@ class ProductionScalpEngine:
                     """, start_of_month)
                     self.monthly_realized_pnl = float(sum_row['month_pnl'])
                     
-                    # 2. تحديد آخر رقم تسلسلي
+                    # استرجاع آخر رقم تسلسلي
                     count_row = await conn.fetchrow("SELECT COUNT(*) as total FROM trades")
                     self.trade_counter = int(count_row['total'])
 
-                    # 3. استعادة الصفقات المفتوحة التي انقطعت
+                    # استعادة الصفقات المفتوحة
                     open_rows = await conn.fetch("SELECT * FROM trades WHERE status = 'OPEN'")
                     for r in open_rows:
+                        entry_p = float(r['entry_price'])
                         self.open_positions[r['symbol']] = {
                             'trade_id': r['trade_id'],
-                            'entry_price': float(r['entry_price']),
+                            'entry_price': entry_p,
                             'qty': float(r['crypto_qty']),
                             'cost': float(r['cost_usd']),
-                            'take_profit': float(r['take_profit']),
                             'stop_loss': float(r['stop_loss']),
                             'entry_time': r['created_at'],
-                            'entry_fee': float(r['entry_fee'])
+                            'entry_fee': float(r['entry_fee']),
+                            'trailing_active': False,
+                            'peak_price': entry_p
                         }
                         self.cash_usdt -= float(r['cost_usd'])
                         logger.warning(f"🔄 [استعادة مركز مفتوح] {r['trade_id']} على {r['symbol']} مستمر في التداول!")
@@ -199,7 +206,7 @@ class ProductionScalpEngine:
             logger.error(f"خطأ اتصال تيليجرام: {e}")
 
     def check_monthly_reset(self):
-        """تصفير الأرباح التراكمية في بداية كل شهر جديد"""
+        """تصفير الأرباح التراكمية في أول دقيقة من كل شهر جديد"""
         now = datetime.now(timezone.utc)
         if now.month != self.current_month:
             logger.info(f"🔄 بداية شهر جديد ({now.strftime('%B')})! تصفير العداد التراكمي للأرباح.")
@@ -254,7 +261,7 @@ class ProductionScalpEngine:
             return None, 0.0
 
     async def open_position(self, symbol: str, current_price: float):
-        """فتح مركز جديد مع تطبيق قيود المخاطر وحفظ البيانات في Postgres"""
+        """فتح مركز جديد مع تهيئة بيانات Trailing Take Profit"""
         allocated_capital = sum(p['cost'] for p in self.open_positions.values())
         if (allocated_capital + self.slot_size) > self.max_total_capital or self.cash_usdt < self.slot_size:
             return
@@ -271,8 +278,8 @@ class ProductionScalpEngine:
         net_invested = cost - entry_fee
         crypto_qty = float(format_precision(net_invested / current_price, 6))
 
-        tp = current_price * (1 + self.take_profit_pct)
         sl = current_price * (1 - self.hard_stop_loss_pct)
+        target_tp_init = current_price * (1 + self.tp_trigger_pct)
 
         self.cash_usdt -= cost
         self.open_positions[symbol] = {
@@ -280,13 +287,13 @@ class ProductionScalpEngine:
             'entry_price': current_price,
             'qty': crypto_qty,
             'cost': cost,
-            'take_profit': tp,
             'stop_loss': sl,
             'entry_time': now,
-            'entry_fee': entry_fee
+            'entry_fee': entry_fee,
+            'trailing_active': False,
+            'peak_price': current_price
         }
 
-        # حفظ الصفقة في قاعدة البيانات
         if self.db_pool:
             try:
                 async with self.db_pool.acquire() as conn:
@@ -296,7 +303,7 @@ class ProductionScalpEngine:
                             cost_usd, crypto_qty, entry_fee, take_profit, stop_loss, created_at
                         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                     """, trade_id, self.system_name, symbol, 'OPEN', entry_price, 
-                         cost, crypto_qty, entry_fee, tp, sl, now)
+                         cost, crypto_qty, entry_fee, target_tp_init, sl, now)
             except Exception as e:
                 logger.error(f"فشل إدراج الصفقة في DB: {e}")
 
@@ -307,8 +314,8 @@ class ProductionScalpEngine:
             f"🪙 *الزوج:* `{symbol}`\n"
             f"💵 *سعر الدخول:* `${current_price:,.4f}`\n"
             f"📦 *حجم المركز:* `${cost:.2f}`\n"
-            f"🎯 *الهدف (TP):* `${tp:,.4f}` (+0.75%)\n"
-            f"🛑 *وقف الخسارة (SL):* `${sl:,.4f}` (-1.00%)\n"
+            f"🎯 *نطاق الأرباح:* `+{self.tp_trigger_pct*100:.1f}%` ⬅ `+{self.tp_max_cap_pct*100:.1f}%` (Trailing)\n"
+            f"🛑 *وقف الخسارة (SL):* `${sl:,.4f}` (-{self.hard_stop_loss_pct*100:.1f}%)\n"
             f"💼 *الكاش المتبقي:* `${self.cash_usdt:,.2f}`\n"
             f"📊 *المراكز النشطة:* `{len(self.open_positions)}/{self.max_open_positions}`"
         )
@@ -316,7 +323,7 @@ class ProductionScalpEngine:
         await self.send_telegram_alert(alert_msg)
 
     async def close_position(self, symbol: str, current_price: float, reason: str, is_maker: bool = False):
-        """إغلاق المركز وتحديث الأرباح الصافية وإرسال تقرير تيليجرام"""
+        """إغلاق المركز وتحديث الأرباح وإرسال تقرير تيليجرام"""
         pos = self.open_positions.pop(symbol)
         gross_value = pos['qty'] * current_price
         exit_fee = gross_value * (self.maker_fee if is_maker else self.taker_fee)
@@ -334,7 +341,6 @@ class ProductionScalpEngine:
         if net_pnl < 0:
             self.cooldown_tracker[symbol] = now + timedelta(minutes=20)
 
-        # تحديث الصفقة في PostgreSQL
         if self.db_pool:
             try:
                 async with self.db_pool.acquire() as conn:
@@ -375,7 +381,7 @@ class ProductionScalpEngine:
         await self.send_telegram_alert(alert_msg)
 
     async def monitor_open_positions(self):
-        """مراقبة الأهداف وتطبيق الخروج الزمني وحساب إجمالي حقوق الملكية MTM"""
+        """مراقبة الأهداف وتطبيق Trailing TP (من 1% إلى 3%) والخروج الزمني"""
         now = datetime.now(timezone.utc)
         total_open_value = 0.0
 
@@ -388,15 +394,42 @@ class ProductionScalpEngine:
             duration_minutes = (now - pos['entry_time']).total_seconds() / 60
             pnl_pct = (current_price - pos['entry_price']) / pos['entry_price']
 
-            # جني الأرباح (Maker = صفر عمولة في MEXC)
-            if current_price >= pos['take_profit']:
-                await self.close_position(symbol, current_price, "Take Profit (Maker 0% Fee)", is_maker=True)
-            # وقف الخسارة الصارم
-            elif current_price <= pos['stop_loss']:
+            # تحديث أعلى قمة سعرية
+            if current_price > pos['peak_price']:
+                pos['peak_price'] = current_price
+
+            # 1. تفعيل Trailing TP عند كسر عتبة +1.0%
+            if not pos['trailing_active'] and pnl_pct >= self.tp_trigger_pct:
+                pos['trailing_active'] = True
+                logger.info(f"🎯 [Trailing Active] {symbol} تجاوزت +{self.tp_trigger_pct*100:.1f}% ربح. بدء ملاحقة القمم!")
+
+            # 2. الخروج الحتمي عند سقف +3.0%
+            if pnl_pct >= self.tp_max_cap_pct:
+                await self.close_position(symbol, current_price, f"Max Cap TP (+{self.tp_max_cap_pct*100:.1f}%)", is_maker=True)
+                continue
+
+            # 3. جني الأرباح التتبعي (ارتداد 0.35% عن القمة)
+            if pos['trailing_active']:
+                drawdown_from_peak = (pos['peak_price'] - current_price) / pos['peak_price']
+                if drawdown_from_peak >= self.trailing_callback_pct:
+                    peak_pnl = (pos['peak_price'] - pos['entry_price']) / pos['entry_price'] * 100
+                    await self.close_position(
+                        symbol, 
+                        current_price, 
+                        f"Trailing TP Hit (قمة: +{peak_pnl:.2f}% | خروج: +{pnl_pct*100:.2f}%)", 
+                        is_maker=True
+                    )
+                    continue
+
+            # 4. وقف الخسارة الصارم (-1.0%)
+            if current_price <= pos['stop_loss']:
                 await self.close_position(symbol, current_price, "Hard Stop Loss (Market)", is_maker=False)
-            # الخروج الزمني لمنع احتجاز السيولة
-            elif duration_minutes >= self.max_holding_minutes and pnl_pct <= -self.time_sl_threshold:
+                continue
+
+            # 5. الخروج الزمني الوقائي
+            if duration_minutes >= self.max_holding_minutes and pnl_pct <= -self.time_sl_threshold:
                 await self.close_position(symbol, current_price, "Time SL (Decay Protection)", is_maker=False)
+                continue
 
         return total_open_value
 
@@ -416,18 +449,16 @@ class ProductionScalpEngine:
         print("\n" + tabulate(rows, headers=headers, tablefmt="fancy_grid"))
 
     async def run(self):
-        # 1. تشغيل خادم الرد السريع لمنع إيقاف الحاوية
         await self.start_dummy_server()
-        
-        # 2. تهيئة الاتصال بقاعدة البيانات ومزامنة الحالة
         await self.init_database()
         await self.auto_heal()
-        logger.info(f"🚀 تم تشغيل {self.system_name} بنجاح.")
+        logger.info(f"🚀 تم تشغيل {self.system_name} بنظام Trailing TP (1% - 3%) بنجاح.")
         
         mode_str = "تجريبي (Paper Trading)" if self.paper_trading else "🔴 حقيقي (Live Money)"
         await self.send_telegram_alert(
             f"🚀 *[{self.system_name}] إقلاع النظام والمزامنة*\n"
             f"الوضع: `{mode_str}`\n"
+            f"🎯 نظام الأرباح: *Trailing (1.0% ⬅ 3.0%)*\n"
             f"المراكز المستعادة: `{len(self.open_positions)}`\n"
             f"الأرباح الشهرية السابقة: `${self.monthly_realized_pnl:,.2f}`\n"
             f"الكاش الحالي: `${self.cash_usdt:,.2f}`"
