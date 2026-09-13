@@ -15,7 +15,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler()]
 )
-logger = logging.getLogger("MEXC_v4_DB")
+logger = logging.getLogger("MEXC_v4_Institutional")
 
 def format_precision(val: float, precision: int = 8) -> Decimal:
     """معالجة الدقة الرقمية وتفادي أخطاء التقريب العلمي"""
@@ -24,7 +24,7 @@ def format_precision(val: float, precision: int = 8) -> Decimal:
 
 class ProductionScalpEngine:
     def __init__(self):
-        # 1. المتغيرات البيئية من Railway
+        # 1. المتغيرات البيئية الأساسية من Railway
         self.system_name = os.getenv("SYSTEM_NAME", "MEXC-v4")
         self.paper_trading = os.getenv("PAPER_TRADING", "True").lower() == "true"
         self.initial_capital = float(os.getenv("INITIAL_CAPITAL", "500.0"))
@@ -40,27 +40,31 @@ class ProductionScalpEngine:
         self.tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
         self.tg_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
         
-        # 2. قواعد التداول وإدارة المخاطر المحدثة
-        # أهداف جني الأرباح التتبعي (Trailing TP)
-        self.tp_trigger_pct = 0.010          # تفعيل التتبع عند +1.0%
-        self.tp_max_cap_pct = 0.030          # الخروج الحتمي عند +3.0%
-        self.trailing_callback_pct = 0.0035   # ارتداد 0.35% عن القمة لجني الأرباح
+        # 2. القواعد المؤسسية وإدارة المخاطر (فريم 5m)
+        self.timeframe = "5m"
+        self.base_stop_loss_pct = 0.0060        # وقف الخسارة الابتدائي الصارم (-0.60%)
+        self.min_atr_pct = 0.0025               # فلتر التقلب: حظر الدخول إذا كان ATR أقل من 0.25%
+        self.daily_max_loss_pct = 0.03          # قاطع الدائرة اليومي: إيقاف التداول عند خسارة 3%
+        self.hard_time_cap_minutes = 60         # سقف زمني 60 دقيقة لفريم 5m لتحرير رأس المال
         
-        # إدارة الأمان وحماية الأرباح
-        self.break_even_trigger_pct = 0.0060  # تأمين الدخول عند +0.60% ربح
-        self.hard_stop_loss_pct = 0.010       # وقف الخسارة الصارم الابتدائي (-1.0%)
-        self.hard_time_cap_minutes = 45       # سقف زمني قطعي: إغلاق إجباري بعد 45 دقيقة
-        self.time_sl_threshold = 0.0035       # حماية الركود والتراجع (-0.35%) بعد 20 دقيقة
-        self.soft_time_threshold_min = 20     # فحص الركود بعد 20 دقيقة
+        # نسب الوقف المتحرك المتدرج وقفل الأرباح (Trailing Stop Steps)
+        self.be_trigger_pct = 0.0040            # تأمين الدخول عند +0.40%
+        self.lock_step1_trigger_pct = 0.0080    # عند +0.80% ربح
+        self.lock_step1_profit_pct = 0.0045     # نقفل ربح صافي +0.45%
+        self.trail_activation_pct = 0.0120      # بدء التتبع الصاروخي المفتوح عند +1.20%
+        self.trail_callback_pct = 0.0030        # ارتداد 0.30% فقط عن القمة للخروج
         
-        # هيكل العمولات الخاص بـ MEXC Spot
-        self.taker_fee = 0.001                # 0.10% Taker
-        self.maker_fee = 0.000                # 0.0% Maker (صفر عمولة)
+        # هيكل عمولات MEXC Spot
+        self.taker_fee = 0.001                  # 0.10% Taker
+        self.maker_fee = 0.000                  # 0.0% Maker (صفر عمولة)
         
         # التتبع والأرباح
         self.trade_counter = 0
         self.current_month = datetime.now(timezone.utc).month
+        self.current_day = datetime.now(timezone.utc).day
         self.monthly_realized_pnl = 0.0
+        self.daily_realized_pnl = 0.0
+        self.circuit_breaker_triggered = False
         
         self.open_positions = {}
         self.cooldown_tracker = {}
@@ -85,19 +89,19 @@ class ProductionScalpEngine:
         """خادم ويب خفيف للرد على Healthcheck في Railway لمنع إيقاف الحاوية"""
         try:
             app = web.Application()
-            app.router.add_get('/', lambda r: web.Response(text="MEXC-v4 is running smoothly!"))
+            app.router.add_get('/', lambda r: web.Response(text="MEXC-v4 Institutional Engine is active!"))
             app.router.add_get('/health', lambda r: web.Response(text="OK"))
             self.web_runner = web.AppRunner(app)
             await self.web_runner.setup()
             port = int(os.getenv("PORT", 8080))
             site = web.TCPSite(self.web_runner, '0.0.0.0', port)
             await site.start()
-            logger.info(f"🌐 [Web Server] الخادم المصغر يعمل بنجاح على المنفذ: {port}")
+            logger.info(f"🌐 [Web Server] خادم الفحص المصغر يعمل على المنفذ: {port}")
         except Exception as e:
-            logger.error(f"فشل تشغيل خادم الويب المصغر: {e}")
+            logger.error(f"فشل تشغيل خادم الويب: {e}")
 
     async def init_database(self):
-        """الاتصال بـ PostgreSQL وإنشاء جدول الصفقات إذا لم يكن موجوداً"""
+        """الاتصال بـ PostgreSQL والتحقق من الجداول"""
         if not self.db_url:
             logger.warning("⚠️ لم يتم تعيين DATABASE_URL! سيعمل البوت بالذاكرة المؤقتة فقط.")
             return
@@ -132,7 +136,7 @@ class ProductionScalpEngine:
                     CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
                     CREATE INDEX IF NOT EXISTS idx_trades_created_at ON trades(created_at);
                 """)
-            logger.info("✅ [PostgreSQL] تم الاتصال بقاعدة البيانات والتحقق من الجداول بنجاح.")
+            logger.info("✅ [PostgreSQL] تم الاتصال بقاعدة البيانات بنجاح.")
         except Exception as e:
             logger.error(f"فشل الاتصال بقاعدة البيانات: {e}")
 
@@ -155,19 +159,26 @@ class ProductionScalpEngine:
             try:
                 now = datetime.now(timezone.utc)
                 start_of_month = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+                start_of_day = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
 
                 async with self.db_pool.acquire() as conn:
-                    # استرجاع أرباح الشهر الحالي
-                    sum_row = await conn.fetchrow("""
-                        SELECT COALESCE(SUM(pnl_usd), 0) as month_pnl, COUNT(*) as total_cnt
-                        FROM trades 
-                        WHERE status = 'CLOSED' AND closed_at >= $1
+                    # أرباح الشهر
+                    sum_month = await conn.fetchrow("""
+                        SELECT COALESCE(SUM(pnl_usd), 0) as month_pnl
+                        FROM trades WHERE status = 'CLOSED' AND closed_at >= $1
                     """, start_of_month)
-                    self.monthly_realized_pnl = float(sum_row['month_pnl'])
-                    
-                    # استرجاع آخر رقم تسلسلي
-                    count_row = await conn.fetchrow("SELECT COUNT(*) as total FROM trades")
-                    self.trade_counter = int(count_row['total'])
+                    self.monthly_realized_pnl = float(sum_month['month_pnl'])
+
+                    # أرباح اليوم لقاطع الدائرة
+                    sum_day = await conn.fetchrow("""
+                        SELECT COALESCE(SUM(pnl_usd), 0) as day_pnl
+                        FROM trades WHERE status = 'CLOSED' AND closed_at >= $1
+                    """, start_of_day)
+                    self.daily_realized_pnl = float(sum_day['day_pnl'])
+
+                    # عداد الصفقات
+                    cnt_row = await conn.fetchrow("SELECT COUNT(*) as total FROM trades")
+                    self.trade_counter = int(cnt_row['total'])
 
                     # استعادة الصفقات المفتوحة
                     open_rows = await conn.fetch("SELECT * FROM trades WHERE status = 'OPEN'")
@@ -181,14 +192,13 @@ class ProductionScalpEngine:
                             'stop_loss': float(r['stop_loss']),
                             'entry_time': r['created_at'],
                             'entry_fee': float(r['entry_fee']),
-                            'trailing_active': False,
-                            'break_even_active': False,
-                            'peak_price': entry_p
+                            'peak_price': entry_p,
+                            'trailing_stage': 0  # 0: ابتدائي، 1: تأمين دخول، 2: قفل ربح، 3: تتبع مفتوح
                         }
                         self.cash_usdt -= float(r['cost_usd'])
-                        logger.warning(f"🔄 [استعادة مركز مفتوح] {r['trade_id']} على {r['symbol']} مستمر في التداول!")
+                        logger.warning(f"🔄 [استعادة مركز مفتوح] {r['trade_id']} على {r['symbol']} مستمر في التتبع!")
 
-                logger.info(f"📊 [Postgres] تم استعادة أرباح الشهر: ${self.monthly_realized_pnl:,.2f} | صفقات مستعادة: {len(self.open_positions)}")
+                logger.info(f"📊 [Postgres] أرباح الشهر: ${self.monthly_realized_pnl:,.2f} | صفقات مستعادة: {len(self.open_positions)}")
             except Exception as e:
                 logger.error(f"خطأ استعادة بيانات قاعدة البيانات: {e}")
 
@@ -208,22 +218,29 @@ class ProductionScalpEngine:
         except Exception as e:
             logger.error(f"خطأ اتصال تيليجرام: {e}")
 
-    def check_monthly_reset(self):
-        """تصفير الأرباح التراكمية في أول دقيقة من كل شهر جديد"""
+    def check_period_resets(self):
+        """تصفير الأرباح التراكمية اليومية والشهرية وإعادة تفعيل قاطع الدائرة"""
         now = datetime.now(timezone.utc)
+        
+        # تصفير شهري
         if now.month != self.current_month:
-            logger.info(f"🔄 بداية شهر جديد ({now.strftime('%B')})! تصفير العداد التراكمي للأرباح.")
+            logger.info(f"🔄 بداية شهر جديد ({now.strftime('%B')})! تصفير أرباح الشهر.")
             self.current_month = now.month
             self.monthly_realized_pnl = 0.0
-            asyncio.create_task(
-                self.send_telegram_alert(
-                    f"📅 *[{self.system_name}] إشعار دوري: بداية شهر جديد*\n"
-                    f"تم تصفير عداد الأرباح الشهرية التراكمية لشهر: *{now.strftime('%B %Y')}*."
+
+        # تصفير يومي لقاطع الدائرة (Circuit Breaker)
+        if now.day != self.current_day:
+            self.current_day = now.day
+            self.daily_realized_pnl = 0.0
+            if self.circuit_breaker_triggered:
+                self.circuit_breaker_triggered = False
+                logger.info("🌅 بداية يوم تداول جديد: إعادة تفعيل التداول بعد إيقاف قاطع الدائرة.")
+                asyncio.create_task(
+                    self.send_telegram_alert(f"🌅 *[{self.system_name}] يوم جديد*: استئناف التداول وإعادة ضبط قاطع الدائرة اليومي.")
                 )
-            )
 
     async def check_btc_shield(self) -> bool:
-        """درع اتجاه البيتكوين: حظر الشراء إذا كان BTC أدنى من EMA20 على 15m"""
+        """درع البيتكوين: التحقق من إيجابية الاتجاه العام على فريم 15m"""
         try:
             ohlcv = await self.exchange.fetch_ohlcv('BTC/USDT', timeframe='15m', limit=30)
             df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
@@ -235,35 +252,46 @@ class ProductionScalpEngine:
             return False
 
     async def fetch_signals(self, symbol: str):
-        """تحليل الشموع على فريم 1m مع فلتر الحجم (Volume Spike) ونطاق RSI المضبوط"""
+        """تحليل الشموع على فريم 5 دقائق (5m) مع فلتر ATR لمنع الصفقات في الأسواق الراكدة"""
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe='1m', limit=45)
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=self.timeframe, limit=45)
             df = pd.DataFrame(ohlcv, columns=['t', 'o', 'h', 'l', 'c', 'v'])
             df['c'] = df['c'].astype(float)
+            df['h'] = df['h'].astype(float)
+            df['l'] = df['l'].astype(float)
             df['v'] = df['v'].astype(float)
 
-            # المتوسطات السريعة
-            df['ema_fast'] = df['c'].ewm(span=5, adjust=False).mean()
-            df['ema_slow'] = df['c'].ewm(span=12, adjust=False).mean()
+            # 1. حساب ATR (14) لقياس التقلب والسيولة
+            tr1 = df['h'] - df['l']
+            tr2 = (df['h'] - df['c'].shift()).abs()
+            tr3 = (df['l'] - df['c'].shift()).abs()
+            df['tr'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            df['atr'] = df['tr'].rolling(window=14).mean()
+            current_atr_pct = df['atr'].iloc[-1] / df['c'].iloc[-1]
 
-            # حساب RSI بدقة قياسية
+            # فلتر الركود: إذا كان تقلب الشموع أقل من 0.25% نرفض الدخول تماماً
+            if current_atr_pct < self.min_atr_pct:
+                return None, 0.0
+
+            # 2. المتوسطات والمؤشرات على فريم 5 دقائق
+            df['ema_fast'] = df['c'].ewm(span=5, adjust=False).mean()
+            df['ema_slow'] = df['c'].ewm(span=13, adjust=False).mean()
+
             delta = df['c'].diff()
             gain = (delta.where(delta > 0, 0.0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0.0)).rolling(window=14).mean()
             rs = gain / (loss.replace(0, float('nan')))
             df['rsi'] = 100 - (100 / (1 + rs))
 
-            # فلتر الحجم: متوسط حجم آخر 20 شمعة
             df['vol_ma20'] = df['v'].rolling(window=20).mean()
 
             curr = df.iloc[-1]
             prev = df.iloc[-2]
 
             signal = None
-            # شروط الدخول المتشددة: تقاطع EMA صعودي + RSI في نطاق الزخم النقي + سيولة أعلى من المتوسط
             if (prev['ema_fast'] <= prev['ema_slow']) and (curr['ema_fast'] > curr['ema_slow']):
                 if 45 <= curr['rsi'] <= 62:
-                    if curr['v'] > curr['vol_ma20']:  # شرط السيولة والزخم
+                    if curr['v'] >= curr['vol_ma20']:
                         signal = 'BUY'
 
             return signal, float(curr['c'])
@@ -272,7 +300,17 @@ class ProductionScalpEngine:
             return None, 0.0
 
     async def open_position(self, symbol: str, current_price: float):
-        """فتح مركز جديد مع تهيئة بيانات Trailing Take Profit و Break-Even"""
+        """فتح مركز جديد مع تهيئة الوقف المؤسسي (-0.60%)"""
+        # التحقق من قاطع الدائرة اليومي (3%)
+        max_allowed_daily_loss = self.initial_capital * self.daily_max_loss_pct
+        if self.daily_realized_pnl <= -max_allowed_daily_loss:
+            if not self.circuit_breaker_triggered:
+                self.circuit_breaker_triggered = True
+                msg = f"🛑 *[{self.system_name}] تفعيل قاطع الدائرة اليومي!*\nبلغت الخسارة اليومية `-${abs(self.daily_realized_pnl):.2f}` (تجاوزت 3%). تم تعليق التداول الجديد لليوم لحماية المحفظة."
+                logger.warning(msg)
+                await self.send_telegram_alert(msg)
+            return
+
         allocated_capital = sum(p['cost'] for p in self.open_positions.values())
         if (allocated_capital + self.slot_size) > self.max_total_capital or self.cash_usdt < self.slot_size:
             return
@@ -289,8 +327,8 @@ class ProductionScalpEngine:
         net_invested = cost - entry_fee
         crypto_qty = float(format_precision(net_invested / current_price, 6))
 
-        sl = current_price * (1 - self.hard_stop_loss_pct)
-        target_tp_init = current_price * (1 + self.tp_trigger_pct)
+        # الوقف الابتدائي الصارم -0.60%
+        initial_sl = current_price * (1 - self.base_stop_loss_pct)
 
         self.cash_usdt -= cost
         self.open_positions[symbol] = {
@@ -298,12 +336,11 @@ class ProductionScalpEngine:
             'entry_price': current_price,
             'qty': crypto_qty,
             'cost': cost,
-            'stop_loss': sl,
+            'stop_loss': initial_sl,
             'entry_time': now,
             'entry_fee': entry_fee,
-            'trailing_active': False,
-            'break_even_active': False,
-            'peak_price': current_price
+            'peak_price': current_price,
+            'trailing_stage': 0
         }
 
         if self.db_pool:
@@ -315,21 +352,20 @@ class ProductionScalpEngine:
                             cost_usd, crypto_qty, entry_fee, take_profit, stop_loss, created_at
                         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                     """, trade_id, self.system_name, symbol, 'OPEN', entry_price, 
-                         cost, crypto_qty, entry_fee, target_tp_init, sl, now)
+                         cost, crypto_qty, entry_fee, 0.0, initial_sl, now)
             except Exception as e:
                 logger.error(f"فشل إدراج الصفقة في DB: {e}")
 
         alert_msg = (
-            f"🟢 *[{self.system_name}] صفقة جديدة مفتوحة*\n"
+            f"🟢 *[{self.system_name}] صفقة جديدة ({self.timeframe})*\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"🆔 *رقم الصفقة:* `{trade_id}`\n"
             f"🪙 *الزوج:* `{symbol}`\n"
             f"💵 *سعر الدخول:* `${current_price:,.4f}`\n"
             f"📦 *حجم المركز:* `${cost:.2f}`\n"
-            f"🎯 *نطاق الأرباح:* `+{self.tp_trigger_pct*100:.1f}%` ⬅ `+{self.tp_max_cap_pct*100:.1f}%` (Trailing)\n"
-            f"🛡️ *تأمين الدخول (BE):* عند `+{self.break_even_trigger_pct*100:.1f}%`\n"
-            f"🛑 *وقف الخسارة (SL):* `${sl:,.4f}` (-{self.hard_stop_loss_pct*100:.1f}%)\n"
-            f"⏱️ *السقف الزمني القطعي:* `{self.hard_time_cap_minutes}` دقيقة\n"
+            f"🛑 *وقف الخسارة الابتدائي:* `${initial_sl:,.4f}` (-{self.base_stop_loss_pct*100:.2f}%)\n"
+            f"🛡️ *تأمين الدخول (BE):* عند `+{self.be_trigger_pct*100:.2f}%`\n"
+            f"🎯 *نظام الأرباح:* الوقف المتحرك المتدرج + صعود مفتوح بدون سقف\n"
             f"💼 *الكاش المتبقي:* `${self.cash_usdt:,.2f}`\n"
             f"📊 *المراكز النشطة:* `{len(self.open_positions)}/{self.max_open_positions}`"
         )
@@ -337,7 +373,7 @@ class ProductionScalpEngine:
         await self.send_telegram_alert(alert_msg)
 
     async def close_position(self, symbol: str, current_price: float, reason: str, is_maker: bool = False):
-        """إغلاق المركز وتحديث الأرباح وإرسال تقرير تيليجرام"""
+        """إغلاق المركز وتحديث الأرباح اليومية والشهرية وإرسال تقرير تيليجرام"""
         pos = self.open_positions.pop(symbol)
         gross_value = pos['qty'] * current_price
         exit_fee = gross_value * (self.maker_fee if is_maker else self.taker_fee)
@@ -348,12 +384,13 @@ class ProductionScalpEngine:
 
         self.cash_usdt += net_return
         self.monthly_realized_pnl += net_pnl
+        self.daily_realized_pnl += net_pnl
         now = datetime.now(timezone.utc)
         duration_sec = int((now - pos['entry_time']).total_seconds())
         duration_min = duration_sec / 60
 
         if net_pnl < 0:
-            self.cooldown_tracker[symbol] = now + timedelta(minutes=20)
+            self.cooldown_tracker[symbol] = now + timedelta(minutes=15)
 
         if self.db_pool:
             try:
@@ -388,14 +425,15 @@ class ProductionScalpEngine:
             f"💵 *سعر الخروج:* `${current_price:,.4f}`\n"
             f"📊 *النتيجة:* {pnl_icon} `{'+$' if net_pnl >= 0 else '-$'}{abs(net_pnl):.2f}` ({net_pnl_pct:+.2f}%)\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"📈 *صافي أرباح شهر {month_name}:* `{'+$' if self.monthly_realized_pnl >= 0 else '-$'}{abs(self.monthly_realized_pnl):.2f}`\n"
-            f"💼 *رصيد الكاش اللحظي:* `${self.cash_usdt:,.2f}`"
+            f"📈 *أرباح اليوم:* `{'+$' if self.daily_realized_pnl >= 0 else '-$'}{abs(self.daily_realized_pnl):.2f}`\n"
+            f"📊 *صافي شهر {month_name}:* `{'+$' if self.monthly_realized_pnl >= 0 else '-$'}{abs(self.monthly_realized_pnl):.2f}`\n"
+            f"💼 *رصيد الكاش:* `${self.cash_usdt:,.2f}`"
         )
         logger.info(f"🔒 [إغلاق مركز] {pos['trade_id']} | صافي: ${net_pnl:+.2f}")
         await self.send_telegram_alert(alert_msg)
 
     async def monitor_open_positions(self):
-        """مراقبة الأهداف، تطبيق Break-Even، Trailing TP، والسقف الزمني القطعي"""
+        """مراقبة المراكز وتطبيق الوقف المتحرك المتدرج وقفل الأرباح وملاحقة القمم المفتوحة"""
         now = datetime.now(timezone.utc)
         total_open_value = 0.0
 
@@ -408,43 +446,63 @@ class ProductionScalpEngine:
             duration_minutes = (now - pos['entry_time']).total_seconds() / 60
             pnl_pct = (current_price - pos['entry_price']) / pos['entry_price']
 
-            # تحديث أعلى قمة سعرية سجلتها الصفقة
+            # تحديث أعلى قمة سجلها السعر
             if current_price > pos['peak_price']:
                 pos['peak_price'] = current_price
 
-            # 1. تفعيل تأمين الدخول (Break-Even Stop) فور بلوغ +0.60% ربح
-            if not pos['break_even_active'] and pnl_pct >= self.break_even_trigger_pct:
-                pos['break_even_active'] = True
-                # رفع الوقف لسعر الدخول + تغطية عمولة الدخول Taker
-                be_price = pos['entry_price'] * (1 + self.taker_fee)
+            # -------------------------------------------------------------
+            # خطة الوقف المتحرك المتدرج لحجز المكاسب وملاحقة الصعود الصاروخي
+            # -------------------------------------------------------------
+            
+            # المرحلة 1: تأمين الدخول (Break-Even) فور بلوغ +0.40% ربح
+            if pos['trailing_stage'] < 1 and pnl_pct >= self.be_trigger_pct:
+                pos['trailing_stage'] = 1
+                be_price = pos['entry_price'] * (1 + self.taker_fee)  # تغطية عمولة الدخول
                 if be_price > pos['stop_loss']:
                     pos['stop_loss'] = be_price
-                logger.info(f"🛡️ [Break-Even Activated] تم تأمين صفقة {symbol} عند سعر الدخول!")
+                logger.info(f"🛡️ [Break-Even] تم تأمين صفقة {symbol} عند سعر الدخول!")
 
-            # 2. تفعيل Trailing TP عند كسر عتبة +1.0%
-            if not pos['trailing_active'] and pnl_pct >= self.tp_trigger_pct:
-                pos['trailing_active'] = True
-                logger.info(f"🎯 [Trailing Active] {symbol} تجاوزت +{self.tp_trigger_pct*100:.1f}% ربح. بدء ملاحقة القمم!")
+            # المرحلة 2: قفل ربح مضمون (+0.45%) فور وصول السعر إلى +0.80%
+            if pos['trailing_stage'] < 2 and pnl_pct >= self.lock_step1_trigger_pct:
+                pos['trailing_stage'] = 2
+                lock_price = pos['entry_price'] * (1 + self.lock_step1_profit_pct)
+                if lock_price > pos['stop_loss']:
+                    pos['stop_loss'] = lock_price
+                logger.info(f"🔒 [Lock Profit] تم قفل ربح مضمون (+{self.lock_step1_profit_pct*100:.2f}%) على {symbol}!")
 
-            # 3. الخروج الحتمي عند سقف +3.0% (Hard TP Cap)
-            if pnl_pct >= self.tp_max_cap_pct:
-                await self.close_position(symbol, current_price, f"Max Cap TP (+{self.tp_max_cap_pct*100:.1f}%)", is_maker=True)
+            # المرحلة 3: تفعيل التتبع الصاروخي المفتوح عند تجاوز +1.20%
+            if pnl_pct >= self.trail_activation_pct:
+                if pos['trailing_stage'] < 3:
+                    pos['trailing_stage'] = 3
+                    logger.info(f"🚀 [Uncapped Ride] تم تفعيل التتبع الصاروخي على {symbol}! لا سقف للأرباح.")
+                
+                # الوقف يتبع القمة بمسافة 0.30% فقط لحجز أعلى ربح ممكن
+                dynamic_trail_sl = pos['peak_price'] * (1 - self.trail_callback_pct)
+                if dynamic_trail_sl > pos['stop_loss']:
+                    pos['stop_loss'] = dynamic_trail_sl
+
+            # -------------------------------------------------------------
+            # شروط الخروج والتنفيذ
+            # -------------------------------------------------------------
+
+            # 1. ضرب خط الوقف المتحرك أو وقف الخسارة
+            if current_price <= pos['stop_loss']:
+                if pos['trailing_stage'] == 3:
+                    peak_pct = (pos['peak_price'] - pos['entry_price']) / pos['entry_price'] * 100
+                    reason = f"Trailing Peak Captured (قمة: +{peak_pct:.2f}% | خروج: +{pnl_pct*100:.2f}%)"
+                    await self.close_position(symbol, current_price, reason, is_maker=True)
+                elif pos['trailing_stage'] == 2:
+                    reason = f"Guaranteed Profit Locked (+{pnl_pct*100:.2f}%)"
+                    await self.close_position(symbol, current_price, reason, is_maker=True)
+                elif pos['trailing_stage'] == 1:
+                    reason = "Break-Even Protected (0% Loss)"
+                    await self.close_position(symbol, current_price, reason, is_maker=False)
+                else:
+                    reason = f"Initial Stop Loss (-{self.base_stop_loss_pct*100:.2f}%)"
+                    await self.close_position(symbol, current_price, reason, is_maker=False)
                 continue
 
-            # 4. جني الأرباح التتبعي (Trailing TP Triggered) عند ارتداد 0.35% عن القمة
-            if pos['trailing_active']:
-                drawdown_from_peak = (pos['peak_price'] - current_price) / pos['peak_price']
-                if drawdown_from_peak >= self.trailing_callback_pct:
-                    peak_pnl = (pos['peak_price'] - pos['entry_price']) / pos['entry_price'] * 100
-                    await self.close_position(
-                        symbol, 
-                        current_price, 
-                        f"Trailing TP Hit (قمة: +{peak_pnl:.2f}% | خروج: +{pnl_pct*100:.2f}%)", 
-                        is_maker=True
-                    )
-                    continue
-
-            # 5. السقف الزمني القطعي (Hard Time Cap = 45 دقيقة): تصفية فورية لتحرير الكاش
+            # 2. السقف الزمني الحتمي (60 دقيقة لفريم 5m) لتحرير رأس المال إذا تجمد السعر
             if duration_minutes >= self.hard_time_cap_minutes:
                 await self.close_position(
                     symbol, 
@@ -452,17 +510,6 @@ class ProductionScalpEngine:
                     f"Hard Time Cap ({self.hard_time_cap_minutes}m Timeout)", 
                     is_maker=False
                 )
-                continue
-
-            # 6. الخروج الزمني الوقائي لتفادي الركود والتراجع (-0.35% بعد 20 دقيقة)
-            if duration_minutes >= self.soft_time_threshold_min and pnl_pct <= -self.time_sl_threshold:
-                await self.close_position(symbol, current_price, "Time SL (Decay Protection)", is_maker=False)
-                continue
-
-            # 7. وقف الخسارة الصارم أو وقف الدخول (SL / Break-Even Hit)
-            if current_price <= pos['stop_loss']:
-                reason_str = "Break-Even Protected (0% Risk)" if pos['break_even_active'] else "Hard Stop Loss (Market)"
-                await self.close_position(symbol, current_price, reason_str, is_maker=False)
                 continue
 
         return total_open_value
@@ -473,12 +520,15 @@ class ProductionScalpEngine:
         headers = ["المعيار", "القيمة"]
         rows = [
             ["النظام", self.system_name],
+            ["الإطار الزمني", self.timeframe],
             ["الكاش المتاح", f"${self.cash_usdt:,.2f}"],
             ["رأس المال المحجوز بالصفقات", f"${allocated_cap:,.2f} / ${self.max_total_capital:,.2f}"],
             ["إجمالي حقوق الملكية (MTM)", f"${total_mtm_equity:,.2f}"],
+            ["أرباح اليوم", f"${self.daily_realized_pnl:,.2f}"],
             ["أرباح الشهر التراكمية (DB)", f"${self.monthly_realized_pnl:,.2f}"],
             ["المراكز المفتوحة النشطة", f"{len(self.open_positions)} / {self.max_open_positions}"],
-            ["إجمالي الصفقات المنفذة", f"{self.trade_counter}"]
+            ["إجمالي الصفقات المنفذة", f"{self.trade_counter}"],
+            ["حالة قاطع الدائرة اليومي (3%)", "🚨 متوقف مؤقتاً" if self.circuit_breaker_triggered else "✅ نشط وآمن"]
         ]
         print("\n" + tabulate(rows, headers=headers, tablefmt="fancy_grid"))
 
@@ -486,28 +536,31 @@ class ProductionScalpEngine:
         await self.start_dummy_server()
         await self.init_database()
         await self.auto_heal()
-        logger.info(f"🚀 تم تشغيل {self.system_name} بالنسخة المحسنة (Break-Even + Hard 45m Cap) بنجاح.")
+        logger.info(f"🚀 تم تشغيل {self.system_name} بالنموذج المؤسسي المطور بنجاح.")
         
         mode_str = "تجريبي (Paper Trading)" if self.paper_trading else "🔴 حقيقي (Live Money)"
         await self.send_telegram_alert(
-            f"🚀 *[{self.system_name}] إقلاع النظام المطور بنجاح*\n"
-            f"الوضع: `{mode_str}`\n"
-            f"🎯 *نظام الأرباح:* Trailing (1.0% ⬅ 3.0%)\n"
-            f"🛡️ *تأمين الدخول:* مفعل تلقائياً عند `+0.60%`\n"
-            f"⏱️ *السقف الزمني:* `{self.hard_time_cap_minutes}` دقيقة كحد أقصى\n"
-            f"المراكز المستعادة: `{len(self.open_positions)}`\n"
-            f"الكاش الحالي: `${self.cash_usdt:,.2f}`"
+            f"🚀 *[{self.system_name}] تشغيل المحرك المؤسسي المطور*\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📊 *الفريم الزمني:* `{self.timeframe}`\n"
+            f"🛑 *وقف الخسارة الابتدائي:* `-{self.base_stop_loss_pct*100:.2f}%`\n"
+            f"🛡️ *تأمين الدخول (BE):* عند `+{self.be_trigger_pct*100:.2f}%`\n"
+            f"🔒 *قفل الأرباح الأول:* عند `+{self.lock_step1_profit_pct*100:.2f}%`\n"
+            f"🚀 *صعود مفتوح (No Cap):* تتبع فوق `+{self.trail_activation_pct*100:.2f}%`\n"
+            f"⚡ *قاطع الدائرة اليومي:* حماية عند خسارة 3%\n"
+            f"💼 *الكاش الحالي:* `${self.cash_usdt:,.2f}`"
         )
         
         cycle_count = 0
         while True:
             try:
-                self.check_monthly_reset()
+                self.check_period_resets()
                 btc_safe = await self.check_btc_shield()
                 open_mtm_value = await self.monitor_open_positions()
                 total_equity = self.cash_usdt + open_mtm_value
 
-                if btc_safe and len(self.open_positions) < self.max_open_positions:
+                # الدخول فقط إذا كان درع BTC إيجابي ولم يتفعل قاطع الدائرة
+                if btc_safe and not self.circuit_breaker_triggered and len(self.open_positions) < self.max_open_positions:
                     for symbol in self.target_symbols:
                         if symbol not in self.open_positions:
                             signal, price = await self.fetch_signals(symbol)
